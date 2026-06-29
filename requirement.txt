@@ -1,7 +1,6 @@
-pandas
 numpy
+pandas
 streamlit
 yfinance
 pandas-ta
 scikit-learn
-pandas_ta_classic
