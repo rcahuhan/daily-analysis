@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
-import pandas_ta_classic as ta  # Swapped seamlessly to community-maintained engine
+import pandas_ta as ta
 from sklearn.ensemble import RandomForestClassifier
 
 # Suppress warnings for clean terminal output
@@ -90,51 +90,73 @@ class IndicatorEngine:
             return pd.DataFrame()
 
         try:
-            df['EMA_20'] = ta.ema(df['Close'], length=20)
-            df['EMA_50'] = ta.ema(df['Close'], length=50)
-            df['EMA_200'] = ta.ema(df['Close'], length=200)
-            df['SMA_50'] = ta.sma(df['Close'], length=50)
-            df['SMA_200'] = ta.sma(df['Close'], length=200)
+            close = df['Close']
+            high  = df['High']
+            low   = df['Low']
+            vol   = df['Volume']
 
-            macd = ta.macd(df['Close'])
-            df['MACD'] = macd['MACD_12_26_9'] if macd is not None else np.nan
-            df['MACD_Sig'] = macd['MACDs_12_26_9'] if macd is not None else np.nan
+            df['EMA_20']  = ta.ema(close, length=20)
+            df['EMA_50']  = ta.ema(close, length=50)
+            df['EMA_200'] = ta.ema(close, length=200)
+            df['SMA_50']  = ta.sma(close, length=50)
+            df['SMA_200'] = ta.sma(close, length=200)
 
-            adx = ta.adx(df['High'], df['Low'], df['Close'])
-            df['ADX'] = adx['ADX_14'] if adx is not None else np.nan
-            df['DMP'] = adx['DMP_14'] if adx is not None else np.nan
-            df['DMN'] = adx['DMN_14'] if adx is not None else np.nan
+            macd = ta.macd(close)
+            if macd is not None:
+                df['MACD']     = macd.get('MACD_12_26_9', np.nan)
+                df['MACD_Sig'] = macd.get('MACDs_12_26_9', np.nan)
+            else:
+                df['MACD'] = df['MACD_Sig'] = np.nan
 
-            supertrend = ta.supertrend(df['High'], df['Low'], df['Close'], length=7, multiplier=3)
-            df['Supertrend'] = supertrend['SUPERT_7_3.0'] if supertrend is not None else np.nan
+            adx = ta.adx(high, low, close)
+            if adx is not None:
+                df['ADX'] = adx.get('ADX_14', np.nan)
+                df['DMP'] = adx.get('DMP_14', np.nan)
+                df['DMN'] = adx.get('DMN_14', np.nan)
+            else:
+                df['ADX'] = df['DMP'] = df['DMN'] = np.nan
 
-            df['RSI_14'] = ta.rsi(df['Close'], length=14)
-            stoch = ta.stoch(df['High'], df['Low'], df['Close'])
-            df['Stoch_K'] = stoch['STOCHk_14_3_3'] if stoch is not None else np.nan
-            df['Stoch_D'] = stoch['STOCHd_14_3_3'] if stoch is not None else np.nan
-            df['CCI'] = ta.cci(df['High'], df['Low'], df['Close'], length=20)
+            supertrend = ta.supertrend(high, low, close, length=7, multiplier=3)
+            if supertrend is not None:
+                df['Supertrend'] = supertrend.get('SUPERT_7_3.0', np.nan)
+            else:
+                df['Supertrend'] = np.nan
 
-            df['OBV'] = ta.obv(df['Close'], df['Volume'])
-            df['VWAP'] = ta.vwap(df['High'], df['Low'], df['Close'], df['Volume'])
-            df['Vol_MA'] = ta.sma(df['Volume'], length=20)
+            df['RSI_14'] = ta.rsi(close, length=14)
 
-            df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
-            bbands = ta.bbands(df['Close'], length=20, std=2)
-            df['BB_Upper'] = bbands['BBU_20_2.0'] if bbands is not None else np.nan
-            df['BB_Lower'] = bbands['BBL_20_2.0'] if bbands is not None else np.nan
-            df['BB_Middle'] = bbands['BBM_20_2.0'] if bbands is not None else np.nan
+            stoch = ta.stoch(high, low, close)
+            if stoch is not None:
+                df['Stoch_K'] = stoch.get('STOCHk_14_3_3', np.nan)
+                df['Stoch_D'] = stoch.get('STOCHd_14_3_3', np.nan)
+            else:
+                df['Stoch_K'] = df['Stoch_D'] = np.nan
 
-            df['Support'] = df['Low'].rolling(window=20).min()
-            df['Resistance'] = df['High'].rolling(window=20).max()
-            df['Breakout'] = (df['Close'] > df['Resistance'].shift(1)).astype(int)
+            df['CCI']    = ta.cci(high, low, close, length=20)
+            df['OBV']    = ta.obv(close, vol)
+            df['VWAP']   = ta.vwap(high, low, close, vol)
+            df['Vol_MA'] = ta.sma(vol, length=20)
+            df['ATR']    = ta.atr(high, low, close, length=14)
 
-            engulfing = ta.cdl_pattern(df['Open'], df['High'], df['Low'], df['Close'], name="engulfing")
+            bbands = ta.bbands(close, length=20, std=2)
+            if bbands is not None:
+                df['BB_Upper']  = bbands.get('BBU_20_2.0', np.nan)
+                df['BB_Lower']  = bbands.get('BBL_20_2.0', np.nan)
+                df['BB_Middle'] = bbands.get('BBM_20_2.0', np.nan)
+            else:
+                df['BB_Upper'] = df['BB_Lower'] = df['BB_Middle'] = np.nan
+
+            df['Support']    = low.rolling(window=20).min()
+            df['Resistance'] = high.rolling(window=20).max()
+            df['Breakout']   = (close > df['Resistance'].shift(1)).astype(int)
+
+            # Candlestick patterns via pandas_ta
+            engulfing = ta.cdl_pattern(df['Open'], high, low, close, name="engulfing")
             df['CDL_Engulfing'] = engulfing.iloc[:, 0] if engulfing is not None and not engulfing.empty else 0
 
-            hammer = ta.cdl_pattern(df['Open'], df['High'], df['Low'], df['Close'], name="hammer")
+            hammer = ta.cdl_pattern(df['Open'], high, low, close, name="hammer")
             df['CDL_Hammer'] = hammer.iloc[:, 0] if hammer is not None and not hammer.empty else 0
 
-            doji = ta.cdl_pattern(df['Open'], df['High'], df['Low'], df['Close'], name="doji")
+            doji = ta.cdl_pattern(df['Open'], high, low, close, name="doji")
             df['CDL_Doji'] = doji.iloc[:, 0] if doji is not None and not doji.empty else 0
 
         except Exception as e:
