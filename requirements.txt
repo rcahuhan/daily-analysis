@@ -4,3 +4,4 @@ streamlit
 yfinance
 pandas-ta
 scikit-learn
+niftystocks
