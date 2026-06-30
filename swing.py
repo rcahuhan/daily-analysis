@@ -9,10 +9,18 @@ import yfinance as yf
 import pandas_ta as ta
 from sklearn.ensemble import RandomForestClassifier
 
+
+
 # Suppress warnings for clean terminal output
 warnings.filterwarnings('ignore')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+
+from nsepython import nse_eq_symbols
+from niftystocks import ns
+
+tickers = ns.get_nifty50_with_ns()  # returns list like ['RELIANCE.NS', 'TCS.NS', ...]
+print(tickers)
 # =====================================================================
 # CONSTANTS & UTILITIES
 # =====================================================================
@@ -28,6 +36,7 @@ NIFTY50_TICKERS = [
     "EICHERMOT.NS", "TATACONSUM.NS", "BRITANNIA.NS", "INDUSINDBK.NS", "DRREDDY.NS",
     "DIVISLAB.NS", "BAJAJ-AUTO.NS", "HEROMOTOCO.NS", "APOLLOHOSP.NS"
 ]
+NIFTY50_TICKERS=tickers
 
 SECTOR_MAP = {
     "RELIANCE.NS": "Energy", "TCS.NS": "IT", "HDFCBANK.NS": "Financial Services",
@@ -84,7 +93,10 @@ class IndicatorEngine:
     @staticmethod
     @st.cache_data(show_spinner=False)
     def calculate_all(df: pd.DataFrame) -> pd.DataFrame:
-        """Append indicator series and candlestick pattern signals."""
+        """
+        Append indicator series and candlestick pattern signals.
+        Tuned for swing trading (1 day – 2 weeks hold, cash-and-carry only).
+        """
         df = df.copy()
         if len(df) < 200:
             return pd.DataFrame()
@@ -93,78 +105,227 @@ class IndicatorEngine:
             close = df['Close']
             high  = df['High']
             low   = df['Low']
+            open_ = df['Open']
             vol   = df['Volume']
 
+            # ── Trend ──────────────────────────────────────────────────────
             df['EMA_20']  = ta.ema(close, length=20)
             df['EMA_50']  = ta.ema(close, length=50)
             df['EMA_200'] = ta.ema(close, length=200)
             df['SMA_50']  = ta.sma(close, length=50)
             df['SMA_200'] = ta.sma(close, length=200)
 
-            macd = ta.macd(close)
-            if macd is not None:
-                df['MACD']     = macd.get('MACD_12_26_9', np.nan)
-                df['MACD_Sig'] = macd.get('MACDs_12_26_9', np.nan)
-            else:
-                df['MACD'] = df['MACD_Sig'] = np.nan
+            # Regime: price above both EMAs = bull, below both = bear
+            df['Trend_Bull'] = (
+                (close > df['EMA_20']) &
+                (close > df['EMA_50']) &
+                (df['EMA_20'] > df['EMA_50'])
+            ).astype(int)
 
-            adx = ta.adx(high, low, close)
-            if adx is not None:
-                df['ADX'] = adx.get('ADX_14', np.nan)
-                df['DMP'] = adx.get('DMP_14', np.nan)
-                df['DMN'] = adx.get('DMN_14', np.nan)
-            else:
-                df['ADX'] = df['DMP'] = df['DMN'] = np.nan
-
-            supertrend = ta.supertrend(high, low, close, length=7, multiplier=3)
+            # Supertrend — primary swing entry/exit signal
+            supertrend = ta.supertrend(high, low, close, length=10, multiplier=3)
             if supertrend is not None:
-                df['Supertrend'] = supertrend.get('SUPERT_7_3.0', np.nan)
+                df['Supertrend']     = supertrend.get('SUPERT_10_3.0', np.nan)
+                df['Supertrend_Dir'] = supertrend.get('SUPERTd_10_3.0', np.nan)  # 1 = bullish, -1 = bearish
             else:
-                df['Supertrend'] = np.nan
+                df['Supertrend'] = df['Supertrend_Dir'] = np.nan
+
+            # ── Momentum ───────────────────────────────────────────────────
+            macd = ta.macd(close, fast=12, slow=26, signal=9)
+            if macd is not None:
+                df['MACD']      = macd.get('MACD_12_26_9', np.nan)
+                df['MACD_Sig']  = macd.get('MACDs_12_26_9', np.nan)
+                df['MACD_Hist'] = macd.get('MACDh_12_26_9', np.nan)
+                # Histogram turning positive = early momentum shift
+                df['MACD_Cross_Up'] = (
+                    (df['MACD_Hist'] > 0) & (df['MACD_Hist'].shift(1) <= 0)
+                ).astype(int)
+            else:
+                df['MACD'] = df['MACD_Sig'] = df['MACD_Hist'] = np.nan
+                df['MACD_Cross_Up'] = 0
 
             df['RSI_14'] = ta.rsi(close, length=14)
+            # RSI coming out of oversold (30–50 zone) is the sweet spot for swing entry
+            df['RSI_Swing_Zone'] = (
+                (df['RSI_14'] > 40) & (df['RSI_14'] < 65)
+            ).astype(int)
+
+            # Rate of Change — short-term momentum burst detection
+            df['ROC_5']  = ta.roc(close, length=5)   # 1-week momentum
+            df['ROC_10'] = ta.roc(close, length=10)  # 2-week momentum
+
+            # Williams %R — faster overbought/oversold than Stochastic for short holds
+            willr = ta.willr(high, low, close, length=14)
+            df['WillR'] = willr if willr is not None else np.nan
+            # -80 to -20 is the actionable swing range
+            df['WillR_Oversold']  = (df['WillR'] < -80).astype(int)
+            df['WillR_Recovering'] = (
+                (df['WillR'] > -80) & (df['WillR'].shift(1) <= -80)
+            ).astype(int)
 
             stoch = ta.stoch(high, low, close)
             if stoch is not None:
                 df['Stoch_K'] = stoch.get('STOCHk_14_3_3', np.nan)
                 df['Stoch_D'] = stoch.get('STOCHd_14_3_3', np.nan)
+                df['Stoch_Cross_Up'] = (
+                    (df['Stoch_K'] > df['Stoch_D']) &
+                    (df['Stoch_K'].shift(1) <= df['Stoch_D'].shift(1)) &
+                    (df['Stoch_K'] < 50)  # only meaningful below midline
+                ).astype(int)
             else:
                 df['Stoch_K'] = df['Stoch_D'] = np.nan
+                df['Stoch_Cross_Up'] = 0
 
-            df['CCI']    = ta.cci(high, low, close, length=20)
-            df['OBV']    = ta.obv(close, vol)
-            df['VWAP']   = ta.vwap(high, low, close, vol)
-            df['Vol_MA'] = ta.sma(vol, length=20)
-            df['ATR']    = ta.atr(high, low, close, length=14)
+            df['CCI'] = ta.cci(high, low, close, length=20)
+            df['OBV'] = ta.obv(close, vol)
+
+            # ── Trend Strength ─────────────────────────────────────────────
+            adx = ta.adx(high, low, close, length=14)
+            if adx is not None:
+                df['ADX'] = adx.get('ADX_14', np.nan)
+                df['DMP'] = adx.get('DMP_14', np.nan)
+                df['DMN'] = adx.get('DMN_14', np.nan)
+                # ADX > 20 with +DI > -DI = trending up, worth swinging
+                df['ADX_Trending'] = (
+                    (df['ADX'] > 20) & (df['DMP'] > df['DMN'])
+                ).astype(int)
+            else:
+                df['ADX'] = df['DMP'] = df['DMN'] = np.nan
+                df['ADX_Trending'] = 0
+
+            # ── Volatility & Bands ─────────────────────────────────────────
+            df['ATR'] = ta.atr(high, low, close, length=14)
 
             bbands = ta.bbands(close, length=20, std=2)
             if bbands is not None:
-                df['BB_Upper']  = bbands.get('BBU_20_2.0', np.nan)
-                df['BB_Lower']  = bbands.get('BBL_20_2.0', np.nan)
-                df['BB_Middle'] = bbands.get('BBM_20_2.0', np.nan)
+                df['BB_Upper']     = bbands.get('BBU_20_2.0', np.nan)
+                df['BB_Lower']     = bbands.get('BBL_20_2.0', np.nan)
+                df['BB_Middle']    = bbands.get('BBM_20_2.0', np.nan)
+                df['BB_Width']     = (df['BB_Upper'] - df['BB_Lower']) / df['BB_Middle']
+                df['BB_Pct']       = bbands.get('BBP_20_2.0', np.nan)  # 0=lower band, 1=upper band
             else:
                 df['BB_Upper'] = df['BB_Lower'] = df['BB_Middle'] = np.nan
+                df['BB_Width'] = df['BB_Pct'] = np.nan
 
+            # Keltner Channel for squeeze detection
+            kc = ta.kc(high, low, close, length=20, scalar=1.5)
+            if kc is not None:
+                df['KC_Upper'] = kc.get('KCUe_20_1.5', np.nan)
+                df['KC_Lower'] = kc.get('KCLe_20_1.5', np.nan)
+                # Squeeze: BB inside KC = compressed volatility, explosive move coming
+                df['Squeeze'] = (
+                    (df['BB_Upper'] < df['KC_Upper']) &
+                    (df['BB_Lower'] > df['KC_Lower'])
+                ).astype(int)
+                # Squeeze release = volatility expanding after compression
+                df['Squeeze_Release'] = (
+                    (df['Squeeze'] == 0) & (df['Squeeze'].shift(1) == 1)
+                ).astype(int)
+            else:
+                df['KC_Upper'] = df['KC_Lower'] = np.nan
+                df['Squeeze'] = df['Squeeze_Release'] = 0
+
+            # ── Volume ─────────────────────────────────────────────────────
+            df['Vol_MA']    = ta.sma(vol, length=20)
+            df['VWAP']      = ta.vwap(high, low, close, vol)
+            df['Vol_Ratio'] = vol / df['Vol_MA']  # > 1.5 = above-average volume
+            # Volume surge on an up day = institutional accumulation signal
+            df['Vol_Surge_Up'] = (
+                (df['Vol_Ratio'] > 1.5) & (close > open_)
+            ).astype(int)
+
+            # ── Support / Resistance / Breakout ────────────────────────────
             df['Support']    = low.rolling(window=20).min()
             df['Resistance'] = high.rolling(window=20).max()
-            df['Breakout']   = (close > df['Resistance'].shift(1)).astype(int)
+            # Confirmed breakout: close above resistance + volume surge
+            df['Breakout'] = (
+                (close > df['Resistance'].shift(1)) &
+                (df['Vol_Ratio'] > 1.2)
+            ).astype(int)
 
-            # Candlestick patterns via pandas_ta
-            engulfing = ta.cdl_pattern(df['Open'], high, low, close, name="engulfing")
-            df['CDL_Engulfing'] = engulfing.iloc[:, 0] if engulfing is not None and not engulfing.empty else 0
+            # Pivot Points (standard floor trader pivots from previous day)
+            df['Pivot']  = (high.shift(1) + low.shift(1) + close.shift(1)) / 3
+            df['PP_R1']  = 2 * df['Pivot'] - low.shift(1)
+            df['PP_S1']  = 2 * df['Pivot'] - high.shift(1)
+            df['PP_R2']  = df['Pivot'] + (high.shift(1) - low.shift(1))
+            df['PP_S2']  = df['Pivot'] - (high.shift(1) - low.shift(1))
 
-            hammer = ta.cdl_pattern(df['Open'], high, low, close, name="hammer")
-            df['CDL_Hammer'] = hammer.iloc[:, 0] if hammer is not None and not hammer.empty else 0
+            # ── ATR-based Risk Levels ───────────────────────────────────────
+            # For each bar: suggested stop (1.5×ATR below close) and target (3×ATR above)
+            # Risk:Reward = 1:2 built in
+            df['Stop_Loss']  = close - (1.5 * df['ATR'])
+            df['Target_1']   = close + (2.0 * df['ATR'])
+            df['Target_2']   = close + (3.5 * df['ATR'])
 
-            doji = ta.cdl_pattern(df['Open'], high, low, close, name="doji")
-            df['CDL_Doji'] = doji.iloc[:, 0] if doji is not None and not doji.empty else 0
+            # ── Composite Swing Score (0–6) ─────────────────────────────────
+            # A quick at-a-glance score; use to rank/filter, not as a hard signal
+            df['Swing_Score'] = (
+                df['Trend_Bull'] +          # price in uptrend
+                df['ADX_Trending'] +        # trend has strength
+                df['MACD_Cross_Up'] +       # momentum just turned
+                df['RSI_Swing_Zone'] +      # RSI in healthy entry zone
+                df['Vol_Surge_Up'] +        # volume confirms
+                df['Squeeze_Release']       # volatility just expanded
+            )
+
+            # ── Candlestick Patterns ────────────────────────────────────────
+            for pattern, col in [
+                ("engulfing", "CDL_Engulfing"),
+                ("hammer",    "CDL_Hammer"),
+                ("doji",      "CDL_Doji"),
+                ("morningstar", "CDL_MorningStar"),
+                ("shootingstar", "CDL_ShootingStar"),  # tells you what to AVOID
+            ]:
+                result = ta.cdl_pattern(open_, high, low, close, name=pattern)
+                df[col] = result.iloc[:, 0] if result is not None and not result.empty else 0
+
+            # ── Extension / Overbought Guardrails ──────────────────────────────
+            # How far is price stretched above its own trend, in ATR units?
+            df['Ext_From_EMA20_ATR'] = (close - df['EMA_20']) / df['ATR']
+
+            # Recent short-term move — used to avoid chasing a stock that already popped
+            df['Ret_1D'] = close.pct_change(1)
+            df['Ret_3D'] = close.pct_change(3)
+
+            # Flag stocks that are too extended to be a fresh swing entry
+            df['Overextended'] = (
+                (df['Ext_From_EMA20_ATR'] > 2.5) |   # > 2.5 ATR above EMA20
+                (df['Ret_3D'] > 0.08)                 # already up >8% in 3 sessions
+            ).astype(int)
+
+            # RSI should be RISING into the zone, not already sitting high for days
+            df['RSI_Rising_Into_Zone'] = (
+                (df['RSI_14'] > 40) & (df['RSI_14'] < 60) &
+                (df['RSI_14'] > df['RSI_14'].shift(3))  # momentum building, not stalling
+            ).astype(int)
+
+            # Distinguish accumulation volume from a climax/blow-off day
+            df['Candle_Range'] = high - low
+            df['Range_Pct_of_ATR'] = df['Candle_Range'] / df['ATR']
+            df['Close_Near_High'] = (close - low) / (df['Candle_Range'].replace(0, np.nan))
+
+            df['Climax_Day'] = (
+                (df['Vol_Ratio'] > 2.0) &
+                (df['Range_Pct_of_ATR'] > 2.0) &
+                (df['Close_Near_High'] > 0.85)
+            ).astype(int)  # exhaustion signature — exclude, don't reward
+
+            # Healthy volume confirmation = above-average but NOT a climax
+            df['Vol_Surge_Up'] = (
+                (df['Vol_Ratio'] > 1.3) & (df['Vol_Ratio'] < 2.0) &
+                (close > open_) & (df['Climax_Day'] == 0)
+            ).astype(int)
+
+            # Risk:Reward gate — only score setups with at least 1:1.5 built in
+            df['RR_OK'] = (
+                (df['Target_1'] - close) / (close - df['Stop_Loss']) > 1.5
+            ).astype(int)
 
         except Exception as e:
-            logging.error(f"Error calculating mathematical indicators: {e}")
+            logging.error(f"Error calculating indicators: {e}")
             return pd.DataFrame()
 
         return df
-
 
 # =====================================================================
 # SCORING ENGINE
@@ -172,7 +333,10 @@ class IndicatorEngine:
 class ScoringEngine:
     @staticmethod
     def score_stock(df: pd.DataFrame) -> Tuple[float, float, float]:
-        """Score the latest bar using trend, momentum, volume, volatility and patterns."""
+        """Score the latest bar using trend, momentum, volume, volatility and patterns.
+        Penalizes overextended/climax conditions instead of rewarding them —
+        this engine is tuned to find fresh swing entries, not stocks that already ran.
+        """
         if df.empty or 'EMA_200' not in df.columns or pd.isna(df.iloc[-1]['EMA_200']):
             return 0.0, 0.5, 1.0
 
@@ -181,6 +345,7 @@ class ScoringEngine:
         def safe_value(key, default=np.nan):
             return row[key] if key in row else default
 
+        # ── Trend ──────────────────────────────────────────────────────────
         t_score = 0
         if row['Close'] > row['EMA_20'] > row['EMA_50'] > row['EMA_200']:
             t_score += 2
@@ -203,55 +368,86 @@ class ScoringEngine:
 
         trend_final = np.clip(t_score / 2, -2, 2)
 
+        # ── Momentum (FIXED: overbought no longer scores bullish) ──────────
         m_score = 0
         if not pd.isna(safe_value('RSI_14')):
-            if 40 <= row['RSI_14'] <= 70:
-                m_score += 1
-            elif row['RSI_14'] > 70:
-                m_score += 2
-            elif row['RSI_14'] < 30:
-                m_score -= 2
+            rsi = row['RSI_14']
+            if 45 <= rsi <= 60:
+                m_score += 2          # sweet spot — room to run, not stretched
+            elif 40 <= rsi < 45 or 60 < rsi <= 68:
+                m_score += 1          # acceptable but less ideal
+            elif rsi > 75:
+                m_score -= 2          # genuinely overbought — penalize, don't chase
+            elif rsi < 30:
+                m_score -= 2          # oversold/falling knife risk for swing longs
 
-        if not pd.isna(safe_value('Stoch_K')) and not pd.isna(safe_value('Stoch_D')) and row['Stoch_K'] > row['Stoch_D']:
+        # Reward RSI that's rising into the zone (fresh momentum), not stalled there
+        if safe_value('RSI_Rising_Into_Zone') == 1:
             m_score += 1
-        else:
-            m_score -= 1
+
+        if not pd.isna(safe_value('Stoch_K')) and not pd.isna(safe_value('Stoch_D')):
+            if row['Stoch_K'] > row['Stoch_D'] and row['Stoch_K'] < 80:
+                m_score += 1
+            elif row['Stoch_K'] >= 80:
+                m_score -= 1          # stochastic already pinned high
+            else:
+                m_score -= 1
 
         if not pd.isna(safe_value('CCI')):
-            if row['CCI'] > 100:
-                m_score += 1
+            if 0 < row['CCI'] <= 100:
+                m_score += 1          # building momentum, not extreme
+            elif row['CCI'] > 150:
+                m_score -= 1          # extreme reading = exhaustion risk, not strength
             elif row['CCI'] < -100:
                 m_score -= 1
 
         momentum_final = np.clip(m_score / 2, -2, 2)
 
+        # ── Volume ────────────────────────────────────────────────────────
         v_score = 0
-        if not pd.isna(safe_value('Volume')) and not pd.isna(safe_value('Vol_MA')) and row['Volume'] > row['Vol_MA']:
-            v_score += 1
+        if not pd.isna(safe_value('Vol_Surge_Up')) and row['Vol_Surge_Up'] == 1:
+            v_score += 1               # healthy confirmation volume (already excludes climax)
+        elif not pd.isna(safe_value('Volume')) and not pd.isna(safe_value('Vol_MA')) and row['Volume'] > row['Vol_MA']:
+            v_score += 0.5
+
         if not pd.isna(safe_value('VWAP')) and row['Close'] > row['VWAP']:
             v_score += 1
         else:
             v_score -= 1
+
+        if safe_value('Climax_Day') == 1:
+            v_score -= 2                # blow-off volume = exhaustion, not strength
+
         volume_final = np.clip(v_score, -2, 2)
 
+        # ── Volatility / Bands ───────────────────────────────────────────
         vol_score = 0
         if not pd.isna(safe_value('BB_Upper')) and row['Close'] > row['BB_Upper']:
-            vol_score += 1
+            vol_score -= 1               # riding outside upper band = stretched, not a buy signal
         elif not pd.isna(safe_value('BB_Lower')) and row['Close'] < row['BB_Lower']:
             vol_score -= 1
+        elif not pd.isna(safe_value('BB_Pct')) and 0.3 <= row['BB_Pct'] <= 0.75:
+            vol_score += 1                # comfortably inside the band, room to expand
         vol_final = np.clip(vol_score, -2, 2)
 
+        # ── Patterns / Breakout (quality-gated, not flat reward) ───────────
         p_score = 0
-        if safe_value('Breakout') == 1:
-            p_score += 2
+        if safe_value('Breakout') == 1 and safe_value('Overextended') == 0:
+            p_score += 2                  # breakout only counts if not already extended
+        elif safe_value('Breakout') == 1:
+            p_score += 0                  # extended breakout = no credit, likely late entry
+
         if safe_value('CDL_Engulfing') > 0:
             p_score += 1
         elif safe_value('CDL_Engulfing') < 0:
             p_score -= 1
         if safe_value('CDL_Hammer') > 0:
             p_score += 1
+        if safe_value('CDL_ShootingStar') > 0:
+            p_score -= 1                  # bearish reversal candle near highs
         p_final = np.clip(p_score, -2, 2)
 
+        # ── Combine ──────────────────────────────────────────────────────
         weights = {'trend': 0.40, 'momentum': 0.30, 'volume': 0.15, 'volatility': 0.10, 'patterns': 0.05}
         final_score = (
             (trend_final * weights['trend']) +
@@ -261,11 +457,39 @@ class ScoringEngine:
             (p_final * weights['patterns'])
         )
 
+        # ── Hard guardrails: these override raw score, same intent as
+        #    IndicatorEngine.Overextended / Climax_Day / RR_OK ─────────────
+        overextended = safe_value('Overextended', 0) == 1
+        climax = safe_value('Climax_Day', 0) == 1
+        rr_ok = safe_value('RR_OK', 1) == 1   # default to OK if column missing
+
+        if overextended:
+            final_score -= 1.0            # direct penalty, stacks with momentum/vol penalties above
+        if climax:
+            final_score -= 1.0
+        if not rr_ok:
+            final_score -= 0.5            # poor risk:reward shouldn't score as a clean setup
+
+        final_score = float(np.clip(final_score, -2, 2))
+
         bullish_probability = (final_score + 2) / 4
-        risk_score = np.clip(row['ATR'] / row['Close'] * 100, 0.5, 10.0) if not pd.isna(safe_value('ATR')) and row['ATR'] > 0 else 1.0
+        # Extension also tightens probability — even if score is decent, an extended
+        # stock has a thinner margin before mean reversion kicks in
+        if overextended or climax:
+            bullish_probability = max(0.0, bullish_probability - 0.15)
+
+        risk_score = (
+            np.clip(row['ATR'] / row['Close'] * 100, 0.5, 10.0)
+            if not pd.isna(safe_value('ATR')) and row['ATR'] > 0 else 1.0
+        )
+        # Bump risk_score for extended/climax setups since downside risk is understated
+        # by ATR alone in these cases (mean-reversion risk isn't captured by ATR)
+        if overextended:
+            risk_score = min(10.0, risk_score * 1.3)
+        if climax:
+            risk_score = min(10.0, risk_score * 1.5)
+
         return float(final_score), float(bullish_probability), float(risk_score)
-
-
 # =====================================================================
 # STRATEGY TRADE LEVELS ENGINE
 # =====================================================================
